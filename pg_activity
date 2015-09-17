@@ -1,0 +1,192 @@
+#!/bin/bash
+
+#### Error Handling ####
+
+# Exit on all errors.
+set -e
+
+function traceback()
+{
+	for i in $(seq $((${#FUNCNAME[@]} - 1))); do
+		echo "  frame $i: ${BASH_SOURCE[$i]} line ${BASH_LINENO[$(($i - 1))]}, in ${FUNCNAME[$i]}"
+	done
+}
+
+# Display a message when an error occurs.
+trap "echo -e '\\033[1;31mFATAL ERROR:\\033[0;31m Command \"\$BASH_COMMAND\" exited with status \$?'; traceback; echo -e '\\033[m'" ERR
+
+
+function help() {
+	(
+		echo "Usage:"
+		echo "    $(basename "$0") [COMMAND] [PSQL_ARGS ...]"
+		echo ""
+		echo "Commands:"
+		echo "    help, --help                         show this help message"
+		echo "    summary                              show a concise summary of running queries (the default command if none given)"
+		echo "    status, list, show                   show current running queries"
+		echo "    cancel QUERY_SPEC, term QUERY_SPEC   cancel queries matching QUERY_SPEC"
+		echo "    kill QUERY_SPEC                      forcefully terminate queries matching QUERY_SPEC"
+		echo ""
+		echo "Options:"
+		echo "    --pg-9.1                             target server is running PostgreSQL older than 9.2"
+		echo ""
+		echo "Client Selectors:"
+		echo "    --procpid=PROCPID                    match the client with the given 'procpid' value (see output of 'status')"
+		echo "    --addr=IP_ADDR                       match all clients from the given IP address"
+		echo "    --mine, -m                           match all clients from this machine's first non-loopback IP address"
+		echo "    --state=STATE                        match all clients in the given state"
+		echo "    --application=APPNAME                match all clients with the given application name"
+		echo "    --database=DBNAME                    match all clients using the given database"
+	) > /dev/stderr
+	exit 1
+}
+
+function die() {
+	echo "$@" > /dev/stderr
+	help
+}
+
+declare COMMAND
+declare -a WHERE
+declare -a VAR_ARGS
+declare -a PSQL_ARGS
+PID_COLUMN=pid
+QUERY_COLUMN=query
+STATE_COLUMN=state
+while [ $# -gt 0 ]; do
+	case "$1" in
+		help|--help) help;;
+		status|list|show) COMMAND=show;;
+		cancel|term) COMMAND=cancel;;
+		kill|show92|summary) COMMAND="$1";;
+
+		--pg-9.1)
+			PID_COLUMN=procpid
+			QUERY_COLUMN=current_query
+			STATE_COLUMN=
+			;;
+
+		--procpid=*)
+			WHERE=("${WHERE[@]}" ":\"pid_column\"=:'procpid'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=procpid=${1#--procpid=}")
+			;;
+
+		--addr=*)
+			WHERE=("${WHERE[@]}" "client_addr=:'address'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=address=${1#--addr=}")
+			;;
+
+		--mine|-m)
+			ADDR=$(ip addr show | gawk '/^    inet /{sub(/\/[0-9]*$/, "", $2); if($2 != "127.0.0.1") {print $2}}; {}' | head -n 1)
+			WHERE=("${WHERE[@]}" "client_addr=:'address'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=address=$ADDR")
+			;;
+
+		--state=*)
+			WHERE=("${WHERE[@]}" "state=:'state'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=state=${1#--state=}")
+			;;
+
+		--application=*)
+			WHERE=("${WHERE[@]}" "application_name=:'application'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=application=${1#--application=}")
+			;;
+
+		--database=*)
+			WHERE=("${WHERE[@]}" "datname=:'database'")
+			VAR_ARGS=("${VAR_ARGS[@]}" "--set=database=${1#--database=}")
+			;;
+
+		# `psql` options:
+		-c|-d|-f|-v|-L|-o|-F|-P|-R|-T|-h|-p|-U) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1" "$2"); shift;;
+
+		--command=*|--dbname=*|--file=*|--set=*=*|--variable=*=*|--log-file=*) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		--output=*|--field-separator=*|--pset=*|--record-separator=*) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		--table-attr=*|--host=*|--port=*|--username=*) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+
+		-l|-V|-X|-1|-?|-a|-e|-E|-n|-q|-s|-S|-A|-H|-t|-x|-z|-0|-w|-W) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+
+		--list|--version|--no-psqlrc|--single-transaction|--help|--echo-all) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		--echo-queries|--echo-hidden|--no-readline|--quiet|--single-step) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		--single-line|--no-align|--html|--tuples-only|--expanded) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		--field-separator-zero|--record-separator-zero|--no-password|--password) PSQL_ARGS=("${PSQL_ARGS[@]}" "$1");;
+		# end `psql` options
+
+		-*)
+			die "Unrecognized option: '$1'"
+			;;
+
+		*)
+			if [ -z "$COMMAND" ]; then
+				die "Unrecognized command: '$1'"
+			else
+				PSQL_ARGS=("${PSQL_ARGS[@]}" "$1")
+			fi
+			;;
+	esac
+	shift
+done
+
+
+VAR_ARGS=(
+	"${VAR_ARGS[@]}"
+	"--set=pid_column=$PID_COLUMN"
+	"--set=query_column=$QUERY_COLUMN"
+	"--set=state_column=${STATE_COLUMN:-NULL}"
+)
+
+HL_PGSQL=$(realpath ${BASH_SOURCE[0]})-hl.awk
+if [ -t 1 ]; then
+	if [ -f "$HL_PGSQL" ]; then
+		# stdout is a TTY; highlight output.
+		exec > >(gawk -f "$HL_PGSQL")
+	else
+		echo -e "\\033[1;33mCouldn't find highlight script at $HL_PGSQL !\\033[m"
+	fi
+fi
+
+function psql_run() {
+	[ ${#WHERE[@]} -gt 0 ] && WHERE=$(printf " AND %s" "${WHERE[@]}")
+
+	QUERY="$1 WHERE :\"pid_column\" != pg_backend_pid() ${WHERE} $2"
+
+	psql_run_raw -f <(echo "$QUERY")
+}
+
+function psql_run_raw() {
+	PAGER=$(which cat) psql postgres "${VAR_ARGS[@]}" "${PSQL_ARGS[@]}" "$@"
+}
+
+
+case "$COMMAND" in
+	cancel|kill)
+		FUNC="pg_cancel_backend"
+		[ "$COMMAND" == "kill" ] && FUNC="pg_terminate_backend"
+		PSQL_ARGS=("${PSQL_ARGS[@]}" "--set=termfunc=$FUNC")
+
+		[ ${#WHERE[@]} -gt 0 ] || die "'$COMMAND' command requires a client selector!"
+
+		psql_run "SELECT :\"termfunc\"(:\"pid_column\") FROM pg_stat_activity"
+		;;
+
+	status|list|show)
+		psql_run "SELECT datname, :\"pid_column\", usename, application_name, COALESCE(client_hostname, host(client_addr)) AS client,
+				backend_start::timestamp, xact_start::timestamp, now() - xact_start AS xact_runtime,
+				query_start::timestamp, waiting, ${STATE_COLUMN:+:state_column,} :\"query_column\"
+			FROM pg_stat_activity" "ORDER BY xact_start, query_start, backend_start"
+		;;
+
+	''|summary)
+		WHERE=("${WHERE[@]}" "backend_start IS NOT NULL")
+
+		psql_run "SELECT :\"pid_column\", :state_column || (CASE WHEN waiting THEN ' (WAIT)' ELSE '' END) AS state,
+				application_name AS application, COALESCE(client_hostname, host(client_addr)) AS client, usename AS user, datname AS db,
+				now() - backend_start::timestamp AS backend_runtime, now() - xact_start AS xact_runtime,
+				CASE :state_column WHEN 'idle' THEN NULL ELSE now() - query_start::timestamp END AS query_runtime,
+				CASE :state_column WHEN 'idle' THEN NULL ELSE :\"query_column\" END AS query
+			FROM pg_stat_activity" "ORDER BY xact_start, query_start, backend_start"
+		;;
+
+	*) help;;
+esac
